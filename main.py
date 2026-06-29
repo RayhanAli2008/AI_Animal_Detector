@@ -1,24 +1,27 @@
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.preprocessing import image
 import cv2
-
-model = tf.keras.models.load_model("C:\Users\Rayhan\Downloads\animalGuesser.keras")
+print('hi')
 class_names = ['antelope', 'badger', 'bat', 'bear', 'bee', 'beetle', 'bison', 'boar', 'butterfly', 'cat', 'caterpillar', 'chimpanzee', 'cockroach', 'cow', 'coyote', 'crab', 'crow', 'deer', 'dog', 'dolphin', 'donkey', 'dragonfly', 'duck', 'eagle', 'elephant', 'flamingo', 'fly', 'fox', 'goat', 'goldfish', 'goose', 'gorilla', 'grasshopper', 'hamster', 'hare', 'hedgehog', 'hippopotamus', 'hornbill', 'horse', 'hummingbird', 'hyena', 'jellyfish', 'kangaroo', 'koala', 'ladybugs', 'leopard', 'lion', 'lizard', 'lobster', 'mosquito', 'moth', 'mouse', 'octopus', 'okapi', 'orangutan', 'otter', 'owl', 'ox', 'oyster', 'panda', 'parrot', 'pelecaniformes', 'penguin', 'pig', 'pigeon', 'porcupine', 'possum', 'raccoon', 'rat', 'reindeer', 'rhinoceros', 'sandpiper', 'seahorse', 'seal', 'shark', 'sheep', 'snake', 'sparrow', 'squid', 'squirrel', 'starfish', 'swan', 'tiger', 'turkey', 'turtle', 'whale', 'wolf', 'wombat', 'woodpecker', 'zebra']
 
+model_path  = r"C:\Users\Rayhan\Downloads\animalGuesser.keras"
+model       = tf.keras.models.load_model(model_path)
 
+#Load the webcam
+camera      = cv2.VideoCapture(0)
 
-img = image.load_img(img_path, target_size=(224, 224))
-img_array = image.img_to_array(img)
-img_array = tf.expand_dims(img_array, 0)
+while True:
+    current_web_status = camera.read()
+    boolean_status     = current_web_status[0]
+    frame              = current_web_status[1]
 
-#Make the prediction
-predictions = model.predict(img_array)
-score = predictions[0]
+    if boolean_status == False:
+        print("unable to get frame")
+        break
 
-# Find the animal with the highest score
-winning_animal = class_names[np.argmax(score)]
-confidence = 100 * np.max(score)
-
-
-print(f"\nResult: This image most likely belongs to {winning_animal}with a {confidence:.2f}% confidence.")
+    #process the frame, change it from bgr to rgb
+    processed_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    #resize
+    processed_frame = cv2.resize(processed_frame, (224, 224))
+    #convert to expected input for tensorflow, the image normally has 3 dimensions (height,width,color_channels), but for tensorflow they need a "batch" parameter wo we insert at index 0 a batch parameter and the dafult val is 1 meaning a batch of one image
+    img_array = tf.expand_dims(processed_frame, 0)
