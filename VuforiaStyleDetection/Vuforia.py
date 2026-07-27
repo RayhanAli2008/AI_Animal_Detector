@@ -1,133 +1,150 @@
+import os
 import cv2
 import numpy as np
-import os
 
-# 1. SET UP DATABASE DIRECTORY (Relative to script's directory)
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_DIR = os.path.join(SCRIPT_DIR, "objects_db")
-
-if not os.path.exists(DB_DIR):
-    os.makedirs(DB_DIR)
-    print(f"Created '{DB_DIR}' folder. Add subfolders named after your objects with target images inside them.")
-    exit()
-
-orb = cv2.ORB_create(nfeatures=1000)
-
-# Store loaded descriptors and shapes per object
-# Structure: [{'name': 'ObjectName', 'views': [{'descriptors': ..., 'kp': ..., 'shape': ...}]}]
-db_objects = []
+# Detector configuration
+MIN_MATCHES = 15
+RATIO_THRESHOLD = 0.75
+MAX_FEATURES = 1000
 
 
-# Scan all subdirectories in objects_db
-for object_name in os.listdir(DB_DIR):
-    object_path = os.path.join(DB_DIR, object_name)
-    
-    if os.path.isdir(object_path):
+def load_database(db_path: str):
+    """Loads feature descriptors and shapes for all target images in the database."""
+    if not os.path.exists(db_path):
+        os.makedirs(db_path)
+        print(f"Created directory: '{db_path}'. Add object subfolders containing reference images.")
+        return []
+
+    orb = cv2.ORB_create(nfeatures=MAX_FEATURES)
+    database = []
+
+    for folder_name in os.listdir(db_path):
+        folder_path = os.path.join(db_path, folder_name)
+        if not os.path.isdir(folder_path):
+            continue
+
         views = []
-        for img_name in os.listdir(object_path):
-            img_path = os.path.join(object_path, img_name)
-            
-            # Load view image in grayscale
-            target_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            if target_img is None:
+        for file_name in os.listdir(folder_path):
+            img_path = os.path.join(folder_path, file_name)
+            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
                 continue
-            
-            kp_target, des_target = orb.detectAndCompute(target_img, None)
-            
-            if des_target is not None:
-                views.append({
-                    "descriptors": des_target,
-                    "kp": kp_target,
-                    "shape": target_img.shape
-                })
-                print(f"  └─ Loaded view: '{img_name}' -> Object: '{object_name}'")
-        
+
+            kp, des = orb.detectAndCompute(img, None)
+            if des is not None:
+                h, w = img.shape
+                views.append({"kp": kp, "des": des, "size": (w, h)})
+
         if views:
-            db_objects.append({
-                "name": object_name,
-                "views": views
-            })
+            database.append({"name": folder_name, "views": views})
 
-if not db_objects:
-    print(f"No valid images found inside subfolders of '{DB_DIR}'.")
-    exit()
+    return database
 
-print(f"\nSuccessfully loaded {len(db_objects)} object(s) into database.\n")
 
-# 2. INITIALIZE MATCHER & CAMERA
-bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-camera = cv2.VideoCapture(0)
-window_name = "Multi-Object Feature Detector"
+def find_instances(view: dict, frame_kp: list, frame_des: np.ndarray, matcher: cv2.BFMatcher):
+    """
+    Searches for all matching instances of a target view within frame descriptors.
+    Removes matched inliers iteratively to support duplicate detection.
+    """
+    target_des = view["des"]
+    target_kp = view["kp"]
+    w, h = view["size"]
 
-MIN_MATCH_COUNT = 15
+    unmatched_indices = list(range(len(frame_des)))
+    detected_bounds = []
 
-while True:
-    ret, frame = camera.read()
-    if not ret:
-        break
+    while len(unmatched_indices) >= MIN_MATCHES:
+        sub_des = frame_des[unmatched_indices]
+        matches = matcher.knnMatch(target_des, sub_des, k=2)
 
-    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    kp_frame, des_frame = orb.detectAndCompute(gray_frame, None)
+        # Ratio test filtering
+        good_matches = []
+        matched_train_ids = []
+        for m_pair in matches:
+            if len(m_pair) == 2:
+                m, n = m_pair
+                if m.distance < RATIO_THRESHOLD * n.distance:
+                    good_matches.append(m)
+                    matched_train_ids.append(m.trainIdx)
 
-    any_target_found = False
+        if len(good_matches) < MIN_MATCHES:
+            break
 
-    if des_frame is not None and len(kp_frame) >= MIN_MATCH_COUNT:
-        
-        # Iterate over each registered object in database
-        for obj in db_objects:
-            obj_detected = False
-            
-            # Check against every loaded view 
-            for view in obj["views"]:
-                des_target = view["descriptors"]
-                kp_target = view["kp"]
-                h, w = view["shape"]
+        src_pts = np.float32([target_kp[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([frame_kp[unmatched_indices[idx]].pt for idx in matched_train_ids]).reshape(-1, 1, 2)
 
-                # KNN match for ratio test
-                matches = bf.knnMatch(des_target, des_frame, k=2)
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        if matrix is None or mask is None:
+            break
 
-                # Lowe's Ratio Test
-                good_matches = []
-                for match in matches:
-                    if len(match) == 2:
-                        m, n = match
-                        if m.distance < 0.75 * n.distance:
-                            good_matches.append(m)
+        corners = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
+        projected = np.int32(cv2.perspectiveTransform(corners, matrix))
 
-                # Verify matches and calculate Homography
-                if len(good_matches) >= MIN_MATCH_COUNT:
-                    src_pts = np.float32([kp_target[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                    dst_pts = np.float32([kp_frame[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        if not cv2.isContourConvex(projected):
+            break
 
-                    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        detected_bounds.append(projected)
 
-                    if M is not None:
-                        pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
-                        transformed_pts = cv2.perspectiveTransform(pts, M)
-                        int_pts = np.int32(transformed_pts)
+        # Mask out used keypoints to continue searching for duplicate objects
+        inliers = mask.ravel().tolist()
+        used_train_ids = [matched_train_ids[i] for i, is_inlier in enumerate(inliers) if is_inlier]
+        used_orig_indices = set(unmatched_indices[i] for i in used_train_ids)
+        unmatched_indices = [idx for idx in unmatched_indices if idx not in used_orig_indices]
 
-                        # Check for valid shape (convex polygon)
-                        if cv2.isContourConvex(int_pts):
-                            # Draw outline
-                            cv2.polylines(frame, [int_pts], True, (0, 255, 0), 3, cv2.LINE_AA)
-                            
-                            # Label with Object Name near top-left of target
-                            label_pos = (int_pts[0][0][0], max(30, int_pts[0][0][1] - 10))
-                            cv2.putText(frame, obj['name'], label_pos, 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                            
-                            any_target_found = True
-                            obj_detected = True
-                            break  # Move to next object once a matching view is found
+    return detected_bounds
 
-    if not any_target_found:
-        cv2.putText(frame, "Searching", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    cv2.imshow(window_name, frame)
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    db_path = os.path.join(script_dir, "objects_db")
 
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q') or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-        break
+    database = load_database(db_path)
+    if not database:
+        print(f"No object images found in '{db_path}'. Exiting.")
+        return
 
-camera.release()
-cv2.destroyAllWindows()
+    print(f"Successfully loaded {len(database)} object category(s).")
+
+    orb = cv2.ORB_create(nfeatures=MAX_FEATURES)
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    cap = cv2.VideoCapture(0)
+
+    win_title = "Multi-Object Real-Time Tracker"
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_kp, frame_des = orb.detectAndCompute(gray, None)
+
+        target_found = False
+
+        if frame_des is not None and len(frame_kp) >= MIN_MATCHES:
+            for obj in database:
+                for view in obj["views"]:
+                    bounds_list = find_instances(view, frame_kp, frame_des, matcher)
+                    for bounds in bounds_list:
+                        target_found = True
+                        cv2.polylines(frame, [bounds], isClosed=True, color=(0, 255, 0), thickness=3, lineType=cv2.LINE_AA)
+                        
+                        label_x, label_y = bounds[0][0]
+                        label_pos = (label_x, max(30, label_y - 10))
+                        cv2.putText(frame, obj["name"], label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        if not target_found:
+            cv2.putText(frame, "Searching...", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        cv2.imshow(win_title, frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or cv2.getWindowProperty(win_title, cv2.WND_PROP_VISIBLE) < 1:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
